@@ -1,0 +1,747 @@
+// ==========================================
+// ESP32 DHT11 FORECASTING SYSTEM
+// BVI 3114 - TSO2
+// Simple Moving Average (SMA)
+// ==========================================
+
+const ID = "141lrGKzUISHpNtbnrkLspVz_vtbG_ZZnXeEk1VbdeFU";
+
+const WINDOW_SIZE = 24;
+const FORECAST_HOURS = 24;
+const HOUR = 3600000;
+
+function getSS() {
+  return SpreadsheetApp.openById(ID);
+}
+
+
+// ==========================================
+// 1. RECEIVE ESP32 SENSOR DATA
+// ==========================================
+
+function doGet(e) {
+  return saveData(e);
+}
+
+function doPost(e) {
+  return saveData(e);
+}
+
+function saveData(e) {
+
+  const lock = LockService.getScriptLock();
+
+  try {
+
+    lock.waitLock(10000);
+
+    const data = e.postData && e.postData.contents
+      ? JSON.parse(e.postData.contents)
+      : e.parameter;
+
+    const temp = Number(data.temperature);
+    const hum = Number(data.humidity);
+
+    // Validate sensor readings.
+    if (
+      data.temperature == null ||
+      data.humidity == null ||
+      String(data.temperature).trim() === "" ||
+      String(data.humidity).trim() === "" ||
+      !Number.isFinite(temp) ||
+      !Number.isFinite(hum) ||
+      temp < 0 || temp > 50 ||
+      hum < 20 || hum > 90
+    ) {
+      throw new Error("Invalid sensor data");
+    }
+
+    getSS().getSheetByName("SensorData")
+      .appendRow([new Date(), temp, hum]);
+
+    return response({
+      status: "success",
+      message: "Data saved successfully"
+    });
+
+  } catch (error) {
+
+    return response({
+      status: "error",
+      message: error.message
+    });
+
+  } finally {
+
+    if (lock.hasLock()) lock.releaseLock();
+  }
+}
+
+function response(data) {
+
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// ==========================================
+// 2. READ ACTUAL SENSOR DATA
+// ==========================================
+
+function readSensorData() {
+
+  const sheet = getSS().getSheetByName("SensorData");
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return [];
+
+  return sheet.getRange(2, 1, lastRow - 1, 7)
+    .getValues()
+    .filter(r =>
+
+      r[0] instanceof Date &&
+      Number.isFinite(r[0].getTime()) &&
+      r[0].getTime() <= Date.now() &&
+      Number.isFinite(r[1]) &&
+      Number.isFinite(r[2]) &&
+      r[1] >= 0 && r[1] <= 50 &&
+      r[2] >= 20 && r[2] <= 90 &&
+      String(r[6]).trim().toLowerCase() !== "dummy"
+
+    )
+    .sort((a, b) => a[0] - b[0]);
+}
+
+
+// ==========================================
+// 3. SIMPLE MOVING AVERAGE
+// ==========================================
+
+function calculateSMA(values) {
+
+  const sum = values.reduce(
+    (total, value) => total + value, 0
+  );
+
+  return sum / values.length;
+}
+
+function standardDeviation(values) {
+
+  const mean = calculateSMA(values);
+
+  const variance = values.reduce(
+    (sum, value) =>
+      sum + Math.pow(value - mean, 2), 0
+  ) / (values.length - 1);
+
+  return Math.sqrt(variance);
+}
+
+
+// ==========================================
+// 4. GENERATE 24-HOUR FORECAST
+// ==========================================
+
+function generateForecasts() {
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+
+    const data = readSensorData();
+
+    if (data.length < WINDOW_SIZE) {
+
+      throw new Error(
+        "At least 24 valid readings are required."
+      );
+    }
+
+    // Select the latest 24 actual readings.
+    const recent = data.slice(-WINDOW_SIZE);
+
+    const temperatures = recent.map(r => r[1]);
+    const humidities = recent.map(r => r[2]);
+
+    // Calculate the moving averages.
+    const tempSMA = calculateSMA(temperatures);
+    const humSMA = calculateSMA(humidities);
+
+    // Calculate approximate uncertainty bounds.
+    const tempSD = standardDeviation(temperatures);
+    const humSD = standardDeviation(humidities);
+
+    const tempUpper = Math.min(
+      50, tempSMA + 1.96 * tempSD
+    );
+
+    const tempLower = Math.max(
+      0, tempSMA - 1.96 * tempSD
+    );
+
+    const humUpper = Math.min(
+      90, humSMA + 1.96 * humSD
+    );
+
+    const humLower = Math.max(
+      20, humSMA - 1.96 * humSD
+    );
+
+    const lastTime =
+      data[data.length - 1][0].getTime();
+
+    const now = Date.now();
+
+    // Start at the next full hour.
+    const baseHour =
+      Math.floor(now / HOUR) * HOUR;
+
+    const forecasts = [];
+
+    for (let i = 1; i <= FORECAST_HOURS; i++) {
+
+      forecasts.push([
+
+        new Date(baseHour + i * HOUR),
+
+        round2(tempSMA),
+        round2(tempUpper),
+        round2(tempLower),
+
+        round2(humSMA),
+        round2(humUpper),
+        round2(humLower)
+
+      ]);
+    }
+
+    writeSheet(
+      "Forecasts",
+      [
+        "Timestamp",
+        "Temp Forecast",
+        "Temp Upper",
+        "Temp Lower",
+        "Humidity Forecast",
+        "Humidity Upper",
+        "Humidity Lower"
+      ],
+      forecasts
+    );
+
+    // Remove the old Holt-Winters Method header.
+    getSS().getSheetByName("Forecasts")
+      .getRange("H1").clearContent();
+
+    // Supporting dashboard and accuracy data.
+    const hourly = hourlyAverages(data);
+
+    writeSheet(
+      "HourlyData",
+      [
+        "Timestamp",
+        "Avg Temperature",
+        "Avg Humidity"
+      ],
+      hourly
+    );
+
+    writeCombined(hourly, forecasts);
+
+    saveForecastLog(forecasts);
+
+    evaluateForecasts();
+
+    hideSupportingSheets();
+
+    Logger.log("Forecast generated successfully.");
+    Logger.log("Method: Simple Moving Average");
+    Logger.log("Readings used: " + WINDOW_SIZE);
+    Logger.log("Temperature forecast: " + round2(tempSMA));
+    Logger.log("Humidity forecast: " + round2(humSMA));
+
+    if (now - lastTime > 20 * 60000) {
+
+      Logger.log(
+        "WARNING: Sensor readings are outdated. " +
+        "Reconnect ESP32 for an updated forecast."
+      );
+    }
+
+  } finally {
+
+    lock.releaseLock();
+  }
+}
+
+
+// ==========================================
+// 5. CALCULATE HOURLY AVERAGES
+// ==========================================
+
+function hourlyAverages(data) {
+
+  const groups = {};
+
+  const currentHour =
+    Math.floor(Date.now() / HOUR) * HOUR;
+
+  data.forEach(r => {
+
+    const hour =
+      Math.floor(r[0].getTime() / HOUR) * HOUR;
+
+    if (hour >= currentHour) return;
+
+    if (!groups[hour]) {
+
+      groups[hour] = {
+        temp: [],
+        hum: []
+      };
+    }
+
+    groups[hour].temp.push(r[1]);
+    groups[hour].hum.push(r[2]);
+  });
+
+  return Object.keys(groups)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map(hour => [
+
+      new Date(hour),
+
+      round2(calculateSMA(groups[hour].temp)),
+
+      round2(calculateSMA(groups[hour].hum))
+
+    ]);
+}
+
+
+// ==========================================
+// 6. COMBINE ACTUAL AND FORECAST DATA
+// ==========================================
+
+function writeCombined(hourly, forecasts) {
+
+  const rows = hourly.slice(-48).map(r => [
+
+    r[0],
+
+    r[1], "", "", "",
+
+    r[2], "", "", ""
+
+  ]);
+
+  forecasts.forEach(r => {
+
+    rows.push([
+
+      r[0],
+
+      "", r[1], r[2], r[3],
+
+      "", r[4], r[5], r[6]
+
+    ]);
+  });
+
+  writeSheet(
+    "Combined",
+    [
+      "Timestamp",
+      "Temp Actual",
+      "Temp Forecast",
+      "Temp Upper",
+      "Temp Lower",
+      "Humidity Actual",
+      "Humidity Forecast",
+      "Humidity Upper",
+      "Humidity Lower"
+    ],
+    rows
+  );
+}
+
+
+// ==========================================
+// 7. SAVE FORECAST HISTORY
+// ==========================================
+
+function saveForecastLog(forecasts) {
+
+  const sheet = getSheet(
+    "ForecastLog",
+    [
+      "Generated At",
+      "Target Time",
+      "Horizon (h)",
+      "Temp Forecast",
+      "Humidity Forecast"
+    ]
+  );
+
+  const now = new Date();
+
+  const rows = forecasts.map((r, i) => [
+
+    now,
+    r[0],
+    i + 1,
+    r[1],
+    r[4]
+
+  ]).filter(r => r[1] > now);
+
+  if (rows.length === 0) return;
+
+  const start = sheet.getLastRow() + 1;
+
+  ensureRows(sheet, start + rows.length - 1);
+
+  sheet.getRange(start, 1, rows.length, 5)
+    .setValues(rows);
+
+  sheet.getRange(start, 1, rows.length, 2)
+    .setNumberFormat("yyyy-mm-dd hh:mm:ss");
+}
+
+
+// ==========================================
+// 8. FORECAST ACCURACY (MAE AND MAPE)
+// ==========================================
+
+function evaluateForecasts() {
+
+  const hourly = hourlyAverages(readSensorData());
+
+  const actual = {};
+
+  hourly.forEach(r => {
+
+    actual[r[0].getTime()] = r;
+  });
+
+  const log = getSS().getSheetByName("ForecastLog");
+
+  const results = [];
+
+  const tempErrors = [];
+  const humErrors = [];
+
+  const tempPercent = [];
+  const humPercent = [];
+
+  if (log && log.getLastRow() > 1) {
+
+    const rows = log.getRange(
+      2, 1, log.getLastRow() - 1, 5
+    ).getValues();
+
+    rows.forEach(r => {
+
+      if (
+        !(r[0] instanceof Date) ||
+        !(r[1] instanceof Date) ||
+        r[0] > r[1] ||
+        !Number.isFinite(r[3]) ||
+        !Number.isFinite(r[4])
+      ) return;
+
+      const a = actual[r[1].getTime()];
+
+      if (!a) return;
+
+      const errorT = Math.abs(a[1] - r[3]);
+      const errorH = Math.abs(a[2] - r[4]);
+
+      tempErrors.push(errorT);
+      humErrors.push(errorH);
+
+      if (a[1] !== 0) {
+
+        tempPercent.push(
+          errorT / Math.abs(a[1]) * 100
+        );
+      }
+
+      if (a[2] !== 0) {
+
+        humPercent.push(
+          errorH / Math.abs(a[2]) * 100
+        );
+      }
+
+      results.push([
+
+        r[0], r[1], r[2],
+
+        a[1], r[3], round2(errorT),
+
+        a[2], r[4], round2(errorH)
+
+      ]);
+    });
+  }
+
+  writeSheet(
+    "Accuracy",
+    [
+      "Generated At",
+      "Target Time",
+      "Horizon (h)",
+      "Temp Actual",
+      "Temp Forecast",
+      "Temp Abs Error",
+      "Humidity Actual",
+      "Humidity Forecast",
+      "Humidity Abs Error"
+    ],
+    results
+  );
+
+  writeSheet(
+    "Metrics",
+    ["Metric", "Value"],
+    [
+
+      ["Forecasts evaluated", results.length],
+
+      ["Temp MAE (C)", metric(tempErrors)],
+
+      ["Temp MAPE (%)", metric(tempPercent)],
+
+      ["Humidity MAE (%RH)", metric(humErrors)],
+
+      ["Humidity MAPE (%)", metric(humPercent)],
+
+      [
+        "Accuracy Status",
+        results.length
+          ? "Evaluated"
+          : "Waiting for actual readings"
+      ]
+
+    ]
+  );
+}
+
+function metric(values) {
+
+  return values.length
+    ? round2(calculateSMA(values))
+    : "";
+}
+
+
+// ==========================================
+// 9. WORKSHEET MANAGEMENT
+// ==========================================
+
+function getSheet(name, headers) {
+
+  const ss = getSS();
+
+  let sheet = ss.getSheetByName(name);
+
+  if (!sheet) sheet = ss.insertSheet(name);
+
+  sheet.getRange(1, 1, 1, headers.length)
+    .setValues([headers])
+    .setFontWeight("bold");
+
+  sheet.setFrozenRows(1);
+
+  return sheet;
+}
+
+function ensureRows(sheet, required) {
+
+  if (sheet.getMaxRows() < required) {
+
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      required - sheet.getMaxRows()
+    );
+  }
+}
+
+function writeSheet(name, headers, rows) {
+
+  const sheet = getSheet(name, headers);
+
+  if (sheet.getLastRow() > 1) {
+
+    sheet.getRange(
+      2, 1,
+      sheet.getLastRow() - 1,
+      sheet.getLastColumn()
+    ).clearContent();
+  }
+
+  if (rows.length > 0) {
+
+    ensureRows(sheet, rows.length + 1);
+
+    sheet.getRange(
+      2, 1, rows.length, headers.length
+    ).setValues(rows);
+
+    if (name !== "Metrics") {
+
+      sheet.getRange(2, 1, rows.length, 1)
+        .setNumberFormat("yyyy-mm-dd hh:mm:ss");
+
+      if (name === "Accuracy") {
+
+        sheet.getRange(2, 2, rows.length, 1)
+          .setNumberFormat("yyyy-mm-dd hh:mm:ss");
+
+        sheet.getRange(2, 4, rows.length, 6)
+          .setNumberFormat("0.00");
+
+      } else {
+
+        sheet.getRange(
+          2, 2, rows.length, headers.length - 1
+        ).setNumberFormat("0.00");
+      }
+
+    } else {
+
+      sheet.getRange(2, 2, rows.length, 1)
+        .setNumberFormat("0.00");
+
+      sheet.getRange("B2").setNumberFormat("0");
+    }
+  }
+
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+function hideSupportingSheets() {
+
+  const ss = getSS();
+
+  const visible = [
+    "SensorData",
+    "LatestData",
+    "Forecasts"
+  ];
+
+  visible.forEach(name => {
+
+    const sheet = ss.getSheetByName(name);
+
+    if (sheet) sheet.showSheet();
+  });
+
+  const hidden = [
+    "SensorData_Archive",
+    "HourlyData",
+    "ForecastLog",
+    "Combined",
+    "Accuracy",
+    "Metrics"
+  ];
+
+  hidden.forEach(name => {
+
+    const sheet = ss.getSheetByName(name);
+
+    if (sheet) sheet.hideSheet();
+  });
+}
+
+
+// ==========================================
+// 10. RESET OLD FORECAST RESULTS
+// ==========================================
+
+function clearForecastSheets() {
+
+  const ui = SpreadsheetApp.getUi();
+
+  const answer = ui.alert(
+    "Reset Forecasts",
+    "Clear previous forecasting results? " +
+    "Original sensor readings will be preserved.",
+    ui.ButtonSet.YES_NO
+  );
+
+  if (answer !== ui.Button.YES) return;
+
+  const names = [
+    "HourlyData",
+    "Forecasts",
+    "Combined",
+    "ForecastLog",
+    "Accuracy",
+    "Metrics"
+  ];
+
+  names.forEach(name => {
+
+    const sheet = getSS().getSheetByName(name);
+
+    if (sheet && sheet.getLastRow() > 1) {
+
+      sheet.getRange(
+        2, 1,
+        sheet.getLastRow() - 1,
+        sheet.getLastColumn()
+      ).clearContent();
+    }
+  });
+}
+
+
+// ==========================================
+// 11. MENU AND AUTOMATIC FORECASTING
+// ==========================================
+
+function onOpen() {
+
+  SpreadsheetApp.getUi()
+    .createMenu("Sensor Data")
+    .addItem("Generate Forecasts", "generateForecasts")
+    .addItem("Evaluate Accuracy", "evaluateForecasts")
+    .addSeparator()
+    .addItem("Enable Auto Forecast", "createHourlyTrigger")
+    .addItem("Stop Auto Forecast", "stopHourlyTrigger")
+    .addSeparator()
+    .addItem("Clear Forecast Sheets", "clearForecastSheets")
+    .addToUi();
+}
+
+function createHourlyTrigger() {
+
+  stopHourlyTrigger();
+
+  ScriptApp.newTrigger("generateForecasts")
+    .timeBased()
+    .everyHours(1)
+    .create();
+}
+
+function stopHourlyTrigger() {
+
+  ScriptApp.getProjectTriggers().forEach(t => {
+
+    if (t.getHandlerFunction() === "generateForecasts") {
+
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+function round2(value) {
+
+  return Math.round(value * 100) / 100;
+}
